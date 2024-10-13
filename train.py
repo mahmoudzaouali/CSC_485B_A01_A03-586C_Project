@@ -30,8 +30,8 @@ except ImportError:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    tb_writer = prepare_output_and_logger(dataset) # Tensorboard Writer initialization  
+    gaussians = GaussianModel(dataset.sh_degree) 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -46,9 +46,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+
+    # Code added for profiling
+    warmup_iters = 15000  # Define your number of warmup iterations
+    #
+
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):   
+
+        if iteration == warmup_iters:
+            # Start CUDA profiler after warmup
+            torch.cuda.cudart().cudaProfilerStart()
+
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -63,6 +74,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     break
             except Exception as e:
                 network_gui.conn = None
+        # Annotate the iteration with NVTX
+        torch.cuda.nvtx.range_push("Iteration {}".format(iteration))
 
         iter_start.record()
 
@@ -81,16 +94,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        # Annotate forward pass
+        torch.cuda.nvtx.range_push("render")
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        torch.cuda.nvtx.range_pop() # End forward pass
+
+        #Annotate loss computation
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        
+        # Annotate backward pass
+        torch.cuda.nvtx.range_push("backward")
         loss.backward()
+        torch.cuda.nvtx.range_pop() # End backward pass
 
         iter_end.record()
 
@@ -123,13 +145,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
             # Optimizer step
+            torch.cuda.nvtx.range_push("opt.step")
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-
+            torch.cuda.nvtx.range_pop()  # End optimizer step
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+        
+        # End iteration range
+        torch.cuda.nvtx.range_pop()
+    torch.cuda.cudart().cudaProfilerStop()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
