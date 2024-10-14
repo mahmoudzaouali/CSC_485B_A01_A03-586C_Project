@@ -1,0 +1,6 @@
+cmake
+data
+*.pyc
+src
+docs
+output
