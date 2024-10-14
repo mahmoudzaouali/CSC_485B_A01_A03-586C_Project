@@ -1,18 +1,68 @@
 
 # Environment Setup
 
-This [here](https://www.youtube.com/watch?v=UXtuigy_wYc) video provides step-by-step instructions of how to build the development environment. We build two environment for development. One on windows and the other one on Ubuntu.
+This [here](https://www.youtube.com/watch?v=UXtuigy_wYc) video provides
+step-by-step instructions of how to build the development environment. We build
+two environment for development. One on windows and the other one on Ubuntu.
 
-## For Windows: 
+## Cloning the Repository
 
+```shell
+git clone https://github.com/graphdeco-inria/gaussian-splatting --recursive
+cd gausian-splatting
+```
 
-## For Ubuntu:
+## Local Setup
 
+### For Windows
 
+Our default, provided install method is based on Conda package and environment
+management:
 
+```shell
+SET DISTUTILS_USE_SDK=1 # Windows only
+conda env create --file environment-win.yml
+conda activate gaussian_splatting
 
+```
+
+### For Ubuntu:
+
+Our default, provided install method is based on Conda package and environment
+management:
+
+```shell
+conda env create --file environment-linux.yml
+conda activate gaussian_splatting
+```
+
+## Traininig 
+
+Download Dataset, here we're using datasets by `https://huggingface.co/camenduru/`:
+
+```shell
+mkdir data
+cd data
+wget https://huggingface.co/camenduru/gaussian-splatting/resolve/main/tandt_db.zip
+unzip tandt_db.zip
+
+cd ..
+
+python train.py -s data/tandt/train 
+```
+
+## Evaluation
+
+Get further evaluation metrics on the training session
+
+```shell
+python train.py -s <path to COLMAP or NeRF Synthetic dataset> --eval # Train with train/test split
+python render.py -m <path to trained model> # Generate renderings
+python metrics.py -m <path to trained model> # Compute error metrics on renderings
+```
 
 # 3D Gaussian Splatting for Real-Time Radiance Field Rendering
+
 Bernhard Kerbl*, Georgios Kopanas*, Thomas Leimkühler, George Drettakis (* indicates equal contribution)<br>
 | [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | [Video](https://youtu.be/T_kXY43VZnk) | [Other GRAPHDECO Publications](http://www-sop.inria.fr/reves/publis/gdindex.php) | [FUNGRAPH project page](https://fungraph.inria.fr) |<br>
 | [T&T+DB COLMAP (650MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip) | [Pre-trained Models (14 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip) | [Viewers for Windows (60MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/binaries/viewers.zip) | [Evaluation Images (7 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/evaluation/images.zip) |<br>
