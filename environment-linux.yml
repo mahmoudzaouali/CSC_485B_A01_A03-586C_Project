@@ -1,4 +1,4 @@
-name: paper-csc586c-gaussian-splatting
+name: gaussian_splatting
 channels:
   - pytorch
   - conda-forge
