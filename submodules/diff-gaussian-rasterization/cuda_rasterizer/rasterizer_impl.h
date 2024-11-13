@@ -16,6 +16,8 @@
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
 #include <cstdint>
+// rasterizer_impl.cu
+// extern __device__ int globalAtomicCounter;
 
 namespace CudaRasterizer
 {

@@ -48,17 +48,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
 
     # Code added for profiling
-    warmup_iters = 15000  # Define your number of warmup iterations
-    #
-
+    # warmup_iters = 15000  # Define your number of warmup iterations
+    
+    # Define iterations to profile
+    profile_iterations = {1000, 3000, 7000}
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):   
 
-        if iteration == warmup_iters:
-            # Start CUDA profiler after warmup
-            torch.cuda.cudart().cudaProfilerStart()
+        # if iteration == warmup_iters:
+        #     # Start CUDA profiler after warmup
+        #     torch.cuda.cudart().cudaProfilerStart()
 
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -75,8 +76,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
         # Annotate the iteration with NVTX
-        torch.cuda.nvtx.range_push("Iteration {}".format(iteration))
-
+        # torch.cuda.nvtx.range_push("Iteration {}".format(iteration))
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -95,12 +95,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         # Annotate forward pass
-        torch.cuda.nvtx.range_push("render")
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+
+        # torch.cuda.nvtx.range_push("render")
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        # torch.cuda.nvtx.range_pop() # End forward pass
+        # if iteration in profile_iterations:
+        #     torch.cuda.cudart().cudaProfilerStop()
+
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        torch.cuda.nvtx.range_pop() # End forward pass
 
         #Annotate loss computation
 
@@ -110,9 +114,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
         # Annotate backward pass
+
+        # Start and stop profiler only at specified iterations for backward pass
+        if iteration in profile_iterations:
+            torch.cuda.cudart().cudaProfilerStart()
+
+
         torch.cuda.nvtx.range_push("backward")
         loss.backward()
         torch.cuda.nvtx.range_pop() # End backward pass
+
+
+        if iteration in profile_iterations:
+            torch.cuda.cudart().cudaProfilerStop()
+
 
         iter_end.record()
 
@@ -156,7 +171,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # End iteration range
         torch.cuda.nvtx.range_pop()
-    torch.cuda.cudart().cudaProfilerStop()
+    # torch.cuda.cudart().cudaProfilerStop()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

@@ -152,6 +152,9 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
+
+
+
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
@@ -178,6 +181,16 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	return img;
 }
 
+struct CustomLess
+{
+  template <typename DataType>
+  __device__ bool operator()(const DataType &lhs, const DataType &rhs)
+  {
+    return lhs < rhs;
+  }
+};
+
+
 CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
 {
 	BinningState binning;
@@ -185,10 +198,20 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	obtain(chunk, binning.point_list_unsorted, P, 128);
 	obtain(chunk, binning.point_list_keys, P, 128);
 	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
+	
+	// cub::DeviceMergeSort::SortPairs(
+	// 	nullptr, binning.sorting_size,
+	// 	binning.point_list_keys_unsorted, 
+	// 	binning.point_list_unsorted, P, CustomLess());
+ 	
+	
+	// binning.list_sorting_space = binning.point_list_unsorted;
+	
 	cub::DeviceRadixSort::SortPairs(
 		nullptr, binning.sorting_size,
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
+	
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
@@ -298,6 +321,16 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+	
+	// // Sort complete list of (duplicated) Gaussian indices by keys
+	// CHECK_CUDA(cub::DeviceMergeSort::SortPairs(
+	// 	binningState.list_sorting_space,
+	// 	binningState.sorting_size,
+	// 	binningState.point_list_keys_unsorted,
+	// 	binningState.point_list_unsorted,
+	// 	num_rendered, debug))
+
+
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
@@ -306,6 +339,9 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
+
+
+
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -404,6 +440,13 @@ void CudaRasterizer::Rasterizer::backward(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor), debug)
+
+
+	// // **Collect the number of atomicAdd operations here**
+	// int h_globalAtomicCounter;	
+	// cudaMemcpyFromSymbol(&h_globalAtomicCounter, globalAtomicCounter, sizeof(int), 0, cudaMemcpyDeviceToHost);
+	// printf("Total atomicAdd operations: %d\n", h_globalAtomicCounter);
+
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
