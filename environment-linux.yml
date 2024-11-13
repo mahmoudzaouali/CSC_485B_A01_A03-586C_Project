@@ -14,6 +14,8 @@ dependencies:
   - torchaudio
   - torchvision
   - tqdm
+  - tensorboard
+  - six
   - pip:
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn
