@@ -51,6 +51,14 @@ export BW_IMPLEMENTATION=1 # to test our kernel
 # export BW_IMPLEMENTATION=0  # to test the original kernel
 python train.py -s data/tandt/train 
 ```
+## Profiler With Nvidia Nsight Computer 
+
+To profile our kernel with Nvidia Nsight Compute and show the correlation between source and SASS: 
+```shell
+ncu --profile-from-start off --kernel-name renderCUDA_SharedMemory --set full --import-source yes --page source --print-source cuda,sass -o results.ncu-rep python train.py -s data/truck
+
+# RUN THIS COMMAND TO PROFILE THE ORIGINAL KERNEL
+# ncu --profile-from-start off --kernel-name renderCUDABW_original --set full --import-source yes --page source --print-source cuda,sass -o results.ncu-rep python train.py -s data/truck
 
 ## Evaluation
 
