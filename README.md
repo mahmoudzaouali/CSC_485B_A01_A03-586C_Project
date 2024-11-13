@@ -59,6 +59,7 @@ ncu --profile-from-start off --kernel-name renderCUDA_SharedMemory --set full --
 
 # RUN THIS COMMAND TO PROFILE THE ORIGINAL KERNEL
 # ncu --profile-from-start off --kernel-name renderCUDABW_original --set full --import-source yes --page source --print-source cuda,sass -o results.ncu-rep python train.py -s data/truck
+```
 
 ## Evaluation
 
