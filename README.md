@@ -47,7 +47,8 @@ wget https://huggingface.co/camenduru/gaussian-splatting/resolve/main/tandt_db.z
 unzip tandt_db.zip
 
 cd ..
-export BW_IMPLEMENTATION=1 // to test our kernel. export BW_IMPLEMENTATION=0 to test the original kernel
+export BW_IMPLEMENTATION=1 # to test our kernel
+# export BW_IMPLEMENTATION=0  # to test the original kernel
 python train.py -s data/tandt/train 
 ```
 
