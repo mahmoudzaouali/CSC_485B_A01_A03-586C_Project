@@ -15,7 +15,8 @@
 #include <algorithm>
 #include <numeric>
 #include <cuda.h>
-#include "cuda_runtime.h"
+//#include "cuda_runtime.h" //change
+#include <cuda_runtime.h>
 #include "device_launch_parameters.h"
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
@@ -29,6 +30,13 @@ namespace cg = cooperative_groups;
 #include "auxiliary.h"
 #include "forward.h"
 #include "backward.h"
+
+// Bindings for our texture memory //change
+#include <driver_types.h>  // For low-level CUDA bindings (if needed)
+
+// Texture object handles
+cudaTextureObject_t texMeans3D, texViewMatrix, texProjMatrix;
+
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -64,6 +72,27 @@ __global__ void checkFrustum(int P,
 	float3 p_view;
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
+
+////////////////////////////////////////////////////////////
+//change my modifications I am making to see if its chill
+__global__ void checkFrustumNew(
+    int P,
+    cudaTextureObject_t orig_points,
+    cudaTextureObject_t viewmatrix,
+    cudaTextureObject_t projmatrix,
+	bool* present)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	float3 p_view;
+	present[idx] = in_frustumNew(idx, orig_points, viewmatrix, projmatrix, false, p_view);
+}
+
+
+////////////////////////////////////////////////////////////
+
 
 // Generates one key/value pair for all Gaussian / tile overlaps. 
 // Run once per Gaussian (1:N mapping).
@@ -140,16 +169,80 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 // Mark Gaussians as visible/invisible, based on view frustum testing
 void CudaRasterizer::Rasterizer::markVisible(
 	int P,
-	float* means3D,
+	float* means3D, 
 	float* viewmatrix,
 	float* projmatrix,
 	bool* present)
 {
-	checkFrustum << <(P + 255) / 256, 256 >> > (
-		P,
-		means3D,
-		viewmatrix, projmatrix,
-		present);
+	// Here we will remove arguments in our checkFrustum and just try to use texture cache instead to hopefully reduce load
+	// on our L1 and L2
+
+	////////////////////////////////////////////////////////////
+	 // Step 1: Create a CUDA array for means3D (2D array)
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+
+    cudaArray* d_means3DArray;
+    cudaMallocArray(&d_means3DArray, &channelDesc, 3, P); // Width: 3, Height: P
+    cudaMemcpy2DToArray(d_means3DArray, 0, 0, means3D, sizeof(float) * 3, sizeof(float) * 3, P, cudaMemcpyHostToDevice);
+
+    // Step 2: Create CUDA arrays for viewmatrix and projmatrix (1D arrays)
+    cudaArray* d_viewMatrixArray;
+    cudaMallocArray(&d_viewMatrixArray, &channelDesc, 12); // 12 elements
+    cudaMemcpyToArray(d_viewMatrixArray, 0, 0, viewmatrix, sizeof(float) * 12, cudaMemcpyHostToDevice);
+
+    cudaArray* d_projMatrixArray;
+    cudaMallocArray(&d_projMatrixArray, &channelDesc, 16); // 16 elements
+    cudaMemcpyToArray(d_projMatrixArray, 0, 0, projmatrix, sizeof(float) * 16, cudaMemcpyHostToDevice);
+
+	// Step 3: Set up resource descriptors for each texture
+    cudaResourceDesc resDescMeans3D = {};
+    resDescMeans3D.resType = cudaResourceTypeArray;
+    resDescMeans3D.res.array.array = d_means3DArray;
+
+    cudaResourceDesc resDescViewMatrix = {};
+    resDescViewMatrix.resType = cudaResourceTypeArray;
+    resDescViewMatrix.res.array.array = d_viewMatrixArray;
+
+    cudaResourceDesc resDescProjMatrix = {};
+    resDescProjMatrix.resType = cudaResourceTypeArray;
+    resDescProjMatrix.res.array.array = d_projMatrixArray;
+
+	// Step 4: Set up texture descriptors
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0] = cudaAddressModeClamp; // Clamp for out-of-bounds
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.filterMode = cudaFilterModePoint;     // Point sampling
+    texDesc.readMode = cudaReadModeElementType;   // Read as floats
+    texDesc.normalizedCoords = 0;                // No normalization of coordinates
+	
+	// Step 5: Create texture objects
+    cudaCreateTextureObject(&texMeans3D, &resDescMeans3D, &texDesc, nullptr);
+    cudaCreateTextureObject(&texViewMatrix, &resDescViewMatrix, &texDesc, nullptr);
+    cudaCreateTextureObject(&texProjMatrix, &resDescProjMatrix, &texDesc, nullptr);
+
+	// Step 6: Launch the kernel with the texture objects
+    checkFrustumNew<<<(P + 255) / 256, 256>>>(P, texMeans3D, texViewMatrix, texProjMatrix, present);
+	
+	////////////////////////////////////////////////////////////
+
+	// checkFrustum << <(P + 255) / 256, 256 >> > (
+	// 	P,
+	// 	means3D,
+	// 	viewmatrix, projmatrix,
+	// 	present);
+
+	// Launch the kernel
+    //checkFrustum<<<(P + 255) / 256, 256>>>(P, present); //change
+
+	// Step 7: Cleanup
+    cudaDestroyTextureObject(texMeans3D);
+    cudaDestroyTextureObject(texViewMatrix);
+    cudaDestroyTextureObject(texProjMatrix);
+
+    cudaFreeArray(d_means3DArray);
+    cudaFreeArray(d_viewMatrixArray);
+    cudaFreeArray(d_projMatrixArray);
+
 }
 
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)

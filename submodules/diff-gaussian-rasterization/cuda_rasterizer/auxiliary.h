@@ -163,6 +163,103 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	return true;
 }
 
+///////////////////////////////////////
+// __forceinline__ __device__ bool in_frustumNew(int idx,
+// 	cudaTextureObject_t orig_points,
+//     cudaTextureObject_t viewmatrix,
+//     cudaTextureObject_t projmatrix,
+// 	bool prefiltered,
+// 	float3& p_view)
+// {
+// 	// Access 3D point coordinates from texture object (assuming 2D texture)
+//     float x = tex2D<float>(orig_points, 0, idx); // Column 0
+//     float y = tex2D<float>(orig_points, 1, idx); // Column 1
+//     float z = tex2D<float>(orig_points, 2, idx); // Column 2
+//     float3 p_orig = {x, y, z};
+
+// 	const float projmatrixpointer = tex1Dfetch<float>(projmatrix, idx);
+// 	const float viewmatrixpointer = tex1Dfetch<float>(viewmatrix, idx);
+
+
+// 	// Bring points to screen space
+// 	float4 p_hom = transformPoint4x4(p_orig, projmatrixpointer);
+// 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+// 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+// 	p_view = transformPoint4x3(p_orig, viewmatrixpointer);
+
+// 	if (p_view.z <= 0.2f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
+// 	{
+// 		if (prefiltered)
+// 		{
+// 			printf("Point is filtered although prefiltered is set. This shouldn't happen!");
+// 			__trap();
+// 		}
+// 		return false;
+// 	}
+// 	return true;
+// }
+
+__forceinline__ __device__ bool in_frustumNew(
+    int idx,
+    cudaTextureObject_t orig_points, // Texture object for original points
+    cudaTextureObject_t viewMatrix, // Texture object for view matrix
+    cudaTextureObject_t projMatrix, // Texture object for projection matrix
+    bool prefiltered,
+    float3& p_view)
+{
+    // Access original point coordinates from the texture object
+    float3 p_orig = {
+        tex2D<float>(orig_points, 0, idx), // X-coordinate
+        tex2D<float>(orig_points, 1, idx), // Y-coordinate
+        tex2D<float>(orig_points, 2, idx)  // Z-coordinate
+    };
+
+    // Helper function to fetch 4x4 matrix elements from a texture
+    auto fetchMatrix4x4 = [](cudaTextureObject_t matrix, int row, int col) -> float {
+        return tex2D<float>(matrix, col, row);
+    };
+
+    // Helper function to fetch 4x3 matrix elements from a texture
+    auto fetchMatrix4x3 = [](cudaTextureObject_t matrix, int row, int col) -> float {
+        return tex2D<float>(matrix, col, row);
+    };
+
+    // Perform projection transformation
+    float4 p_hom = make_float4(
+        fetchMatrix4x4(projMatrix, 0, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 0, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 0, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 0, 3),
+        fetchMatrix4x4(projMatrix, 1, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 1, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 1, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 1, 3),
+        fetchMatrix4x4(projMatrix, 2, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 2, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 2, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 2, 3),
+        fetchMatrix4x4(projMatrix, 3, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 3, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 3, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 3, 3)
+    );
+
+    // Homogeneous to normalized device coordinates
+    float p_w = 1.0f / (p_hom.w + 1e-7f);
+    float3 p_proj = {p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w};
+
+    // Perform view transformation
+    p_view = make_float3(
+        fetchMatrix4x3(viewMatrix, 0, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 0, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 0, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 0, 3),
+        fetchMatrix4x3(viewMatrix, 1, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 1, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 1, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 1, 3),
+        fetchMatrix4x3(viewMatrix, 2, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 2, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 2, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 2, 3)
+    );
+
+    // Frustum culling logic
+    if (p_view.z <= 0.2f)
+    {
+        if (prefiltered)
+        {
+            printf("Point is filtered although prefiltered is set. This shouldn't happen!\n");
+            __trap();
+        }
+        return false;
+    }
+
+    return true;
+}
+
+
+///////////////////////////////////////
+
 #define CHECK_CUDA(A, debug) \
 A; if(debug) { \
 auto ret = cudaDeviceSynchronize(); \

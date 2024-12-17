@@ -136,6 +136,9 @@ __forceinline__ __device__ float sigmoid(float x)
 	return 1.0f / (1.0f + expf(-x));
 }
 
+// orig_points is a 2d Array, 2nd array is X Y Z
+// view matrix is 4x3 matrix, but accessced a 1d array
+// projmatrix 4x4 matrix, but accecssed as a 1d array
 __forceinline__ __device__ bool in_frustum(int idx,
 	const float* orig_points,
 	const float* viewmatrix,
@@ -162,6 +165,66 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	}
 	return true;
 }
+///  //////////////////
+
+__forceinline__ __device__ bool in_frustumNew(
+    int idx,
+    cudaTextureObject_t orig_points, // Texture object for original points
+    cudaTextureObject_t viewMatrix, // Texture object for view matrix
+    cudaTextureObject_t projMatrix, // Texture object for projection matrix
+    bool prefiltered,
+    float3& p_view)
+{
+    // Access original point coordinates from the texture object
+    float3 p_orig = {
+        tex2D<float>(orig_points, 0, idx), // X-coordinate
+        tex2D<float>(orig_points, 1, idx), // Y-coordinate
+        tex2D<float>(orig_points, 2, idx)  // Z-coordinate
+    };
+
+    // Helper function to fetch 4x4 matrix elements from a texture
+    auto fetchMatrix4x4 = [](cudaTextureObject_t matrix, int row, int col) -> float {
+        return tex2D<float>(matrix, col, row);
+    };
+
+    // Helper function to fetch 4x3 matrix elements from a texture
+    auto fetchMatrix4x3 = [](cudaTextureObject_t matrix, int row, int col) -> float {
+        return tex2D<float>(matrix, col, row);
+    };
+
+    // Perform projection transformation
+    float4 p_hom = make_float4(
+        fetchMatrix4x4(projMatrix, 0, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 0, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 0, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 0, 3),
+        fetchMatrix4x4(projMatrix, 1, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 1, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 1, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 1, 3),
+        fetchMatrix4x4(projMatrix, 2, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 2, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 2, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 2, 3),
+        fetchMatrix4x4(projMatrix, 3, 0) * p_orig.x + fetchMatrix4x4(projMatrix, 3, 1) * p_orig.y + fetchMatrix4x4(projMatrix, 3, 2) * p_orig.z + fetchMatrix4x4(projMatrix, 3, 3)
+    );
+
+    // Homogeneous to normalized device coordinates
+    float p_w = 1.0f / (p_hom.w + 1e-7f);
+    float3 p_proj = {p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w};
+
+    // Perform view transformation
+    p_view = make_float3(
+        fetchMatrix4x3(viewMatrix, 0, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 0, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 0, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 0, 3),
+        fetchMatrix4x3(viewMatrix, 1, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 1, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 1, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 1, 3),
+        fetchMatrix4x3(viewMatrix, 2, 0) * p_orig.x + fetchMatrix4x3(viewMatrix, 2, 1) * p_orig.y + fetchMatrix4x3(viewMatrix, 2, 2) * p_orig.z + fetchMatrix4x3(viewMatrix, 2, 3)
+    );
+
+    // Frustum culling logic
+    if (p_view.z <= 0.2f)
+    {
+        if (prefiltered)
+        {
+            printf("Point is filtered although prefiltered is set. This shouldn't happen!\n");
+            __trap();
+        }
+        return false;
+    }
+
+    return true;
+}
+/////////////////////////////////////////////////////
 
 #define CHECK_CUDA(A, debug) \
 A; if(debug) { \
