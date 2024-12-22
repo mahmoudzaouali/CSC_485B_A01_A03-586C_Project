@@ -153,8 +153,6 @@ void CudaRasterizer::Rasterizer::markVisible(
 }
 
 
-
-
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
@@ -199,14 +197,6 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	obtain(chunk, binning.point_list_keys, P, 128);
 	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
 	
-	// cub::DeviceMergeSort::SortPairs(
-	// 	nullptr, binning.sorting_size,
-	// 	binning.point_list_keys_unsorted, 
-	// 	binning.point_list_unsorted, P, CustomLess());
- 	
-	
-	// binning.list_sorting_space = binning.point_list_unsorted;
-	
 	cub::DeviceRadixSort::SortPairs(
 		nullptr, binning.sorting_size,
 		binning.point_list_keys_unsorted, binning.point_list_keys,
@@ -215,6 +205,7 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
 }
+
 
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
@@ -239,8 +230,10 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	cudaStream_t stream,
 	int* radii,
-	bool debug)
+	bool debug
+	)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -292,16 +285,21 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		stream
 	), debug)
+
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P, stream), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	CHECK_CUDA(cudaMemcpyAsync(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost, stream), debug);
+
+
+	// cudaStreamSynchronize(stream);
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -309,7 +307,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+	duplicateWithKeys << <(P + 255) / 256, 256, 0, stream>> > (
 		P,
 		geomState.means2D,
 		geomState.depths,
@@ -322,15 +320,6 @@ int CudaRasterizer::Rasterizer::forward(
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 	
-	// // Sort complete list of (duplicated) Gaussian indices by keys
-	// CHECK_CUDA(cub::DeviceMergeSort::SortPairs(
-	// 	binningState.list_sorting_space,
-	// 	binningState.sorting_size,
-	// 	binningState.point_list_keys_unsorted,
-	// 	binningState.point_list_unsorted,
-	// 	num_rendered, debug))
-
-
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
 	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
@@ -338,16 +327,16 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit, stream), debug)
 
 
+	// cudaStreamSynchronize(stream);
 
-
-	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemsetAsync(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2), stream), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+		identifyTileRanges << <(num_rendered + 255) / 256, 256, 0, stream>> > (
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
@@ -366,10 +355,12 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color), debug)
+		out_color, stream), debug)
 
 	return num_rendered;
 }
+
+
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
@@ -402,6 +393,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	cudaStream_t stream,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -418,6 +410,8 @@ void CudaRasterizer::Rasterizer::backward(
 
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// cudaStreamSynchronize(stream);
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
@@ -439,13 +433,9 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor, stream), debug)
 
-
-	// // **Collect the number of atomicAdd operations here**
-	// int h_globalAtomicCounter;	
-	// cudaMemcpyFromSymbol(&h_globalAtomicCounter, globalAtomicCounter, sizeof(int), 0, cudaMemcpyDeviceToHost);
-	// printf("Total atomicAdd operations: %d\n", h_globalAtomicCounter);
+	// cudaStreamSynchronize(stream);
 
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
@@ -473,5 +463,8 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		stream), debug)
+
+	// cudaStreamSynchronize(stream);
 }

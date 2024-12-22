@@ -14,9 +14,20 @@ import torch.nn as nn
 import torch
 from . import _C
 
+# def cpu_deep_copy_tuple(input_tuple):
+#     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
+#     return tuple(copied_tensors)
+
+
 def cpu_deep_copy_tuple(input_tuple):
-    copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
-    return tuple(copied_tensors)
+    keys = [
+        "bg", "means3D", "radii", "colors_precomp", "scales", "rotations",
+        "scale_modifier", "cov3Ds_precomp", "viewmatrix", "projmatrix",
+        "tanfovx", "tanfovy", "grad_out_color", "sh", "sh_degree", "campos",
+        "geomBuffer", "num_rendered", "binningBuffer", "imgBuffer", "debug"
+    ]
+    copied_tensors = {key: item.cpu().clone() if isinstance(item, torch.Tensor) else item for key, item in zip(keys, input_tuple)}
+    return copied_tensors
 
 def rasterize_gaussians(
     means3D,
@@ -78,7 +89,6 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             raster_settings.debug
         )
-
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
@@ -89,12 +99,21 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
+
+            # print(f"colors_precomp: {colors_precomp.shape}, dtype: {colors_precomp.dtype}")
+
             num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+
+
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, sh, radii, *geomBuffer, *binningBuffer, *imgBuffer)  # Save tensors for backward
+
+
+
         return color, radii
 
     @staticmethod
@@ -103,41 +122,69 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+
+        # Retrieve all saved tensors
+        (
+            colors_precomp, means3D, scales, rotations, cov3Ds_precomp, sh, radii,
+            *saved_buffers  # Remainder tensors are unpacked into saved_buffers
+        ) = ctx.saved_tensors      
+
+
+        num_views = len(saved_buffers) // 3  # Assuming 3 lists: geomBuffer, binningBuffer, imgBuffer
+
+        # Split saved_buffers into individual lists
+        geomBuffer = saved_buffers[:num_views]        # First num_views tensors
+        binningBuffer = saved_buffers[num_views:2*num_views]  # Next num_views tensors
+        imgBuffer = saved_buffers[2*num_views:]       # Last num_views tensors
+
+
+
+        # # Example: Print to verify the reconstructed lists
+        # print("Number of views:", num_views)
+        # print("GeomBuffer sizes:", [gb.size() for gb in geomBuffer])
+        # print("BinningBuffer sizes:", [bb.size() for bb in binningBuffer])
+        # print("ImgBuffer sizes:", [ib.size() for ib in imgBuffer])
+
+        num_rendered = num_rendered.squeeze(-1)  # Remove singleton dimensions
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
                 means3D, 
-                radii, 
+                radii,  # Batched radii
                 colors_precomp, 
                 scales, 
                 rotations, 
                 raster_settings.scale_modifier, 
                 cov3Ds_precomp, 
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
-                grad_out_color, 
+                raster_settings.viewmatrix, # Batched view matrices
+                raster_settings.projmatrix, # Batched projection matrices
+                raster_settings.tanfovx,  # Batched tan(FoVx)
+                raster_settings.tanfovy,  # Batched tan(FoVy)
+                grad_out_color,  # Batched gradient
                 sh, 
                 raster_settings.sh_degree, 
-                raster_settings.campos,
-                geomBuffer,
-                num_rendered,
-                binningBuffer,
-                imgBuffer,
+                raster_settings.campos, # Batched camera positions
+                geomBuffer,     # Batched geometry buffers
+                num_rendered,   # Tensor/list with per-view values
+                binningBuffer, # Batched binning buffers
+                imgBuffer, # Batched image buffers
                 raster_settings.debug)
+        
+        
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
                 grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
+            
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
+             
+
              grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)
 
         grads = (
@@ -155,15 +202,15 @@ class _RasterizeGaussians(torch.autograd.Function):
         return grads
 
 class GaussianRasterizationSettings(NamedTuple):
-    image_height: int
-    image_width: int 
-    tanfovx : float
-    tanfovy : float
+    image_height: torch.Tensor # Batched heights: Tensor of shape (B,)
+    image_width: torch.Tensor  # Batched widths: Tensor of shape (B,)
+    tanfovx : torch.Tensor     # Batched FOVx: Tensor of shape (B,) in float 
+    tanfovy : torch.Tensor     # Batched FOVy: Tensor of shape (B,) in float 
     bg : torch.Tensor
     scale_modifier : float
-    viewmatrix : torch.Tensor
-    projmatrix : torch.Tensor
-    sh_degree : int
+    viewmatrix : torch.Tensor # Batched view matrices: Tensor of shape (B, 4, 4)
+    projmatrix : torch.Tensor # Batched projection matrices: Tensor of shape (B, 4, 4)
+    sh_degree : int           # Batched camera positions: Tensor of shape (B, 3)  
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
@@ -179,15 +226,27 @@ class GaussianRasterizer(nn.Module):
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
-                raster_settings.viewmatrix,
-                raster_settings.projmatrix)
+                raster_settings.viewmatrix, # Batched view matrices
+                raster_settings.projmatrix) # Batched projection matrices
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, 
+                means3D, 
+                means2D, 
+                opacities, 
+                shs = None, 
+                colors_precomp = None, 
+                scales = None, 
+                rotations = None, 
+                cov3D_precomp = None):
         
-        raster_settings = self.raster_settings
+        """
+        Perform batched rasterization by delegating to the CUDA backend.
+        """
 
+        raster_settings = self.raster_settings
+        
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
         

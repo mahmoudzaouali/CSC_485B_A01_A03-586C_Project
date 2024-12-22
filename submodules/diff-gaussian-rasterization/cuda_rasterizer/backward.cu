@@ -13,11 +13,41 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <iostream>
+#include <cublas_v2.h>
+#include <mma.h>
 
+
+using namespace nvcuda::wmma;
 namespace cg = cooperative_groups;
 
-// Backward pass for conversion of spherical harmonics to RGB for
-// each Gaussian.
+
+__inline__ __device__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+
+__device__ float block_reduce_sum(float val) {
+    __shared__ float shared[BLOCK_SIZE]; // Shared memory for reduction
+    int tid = threadIdx.x;              // Thread index in the block
+
+    // Write thread's value to shared memory
+    shared[tid] = val;
+    __syncthreads();
+
+    // Perform reduction across all threads in the block
+    for (int offset = BLOCK_SIZE / 2; offset > 0; offset /= 2) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    // Return reduced value from the first thread
+    return shared[0];
+}
+
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
 {
     // Compute intermediate values, as it is done during forward
@@ -390,245 +420,231 @@ __global__ void preprocessCUDA(
 }
 
 
+// // Backward kernel with shared memory accumulation New
+// template <uint32_t C>
+// __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+// renderCUDA(
+//     const uint2* __restrict__ ranges,
+//     const uint32_t* __restrict__ point_list,
+//     int W, int H,
+//     const float* __restrict__ bg_color,
+//     const float2* __restrict__ points_xy_image,
+//     const float4* __restrict__ conic_opacity,
+//     const float* __restrict__ colors,
+//     const float* __restrict__ final_Ts,
+//     const uint32_t* __restrict__ n_contrib,
+//     const float* __restrict__ dL_dpixels,
+//     float3* __restrict__ dL_dmean2D,
+//     float4* __restrict__ dL_dconic2D,
+//     float* __restrict__ dL_dopacity,
+//     float* __restrict__ dL_dcolors) 
+// {
+// 	// We rasterize again. Compute necessary block info.
+// 	auto block = cg::this_thread_block();
+// 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+// 	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+// 	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+// 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+// 	const uint32_t pix_id = W * pix.y + pix.x;
+// 	const float2 pixf = { (float)pix.x, (float)pix.y };
 
-// Backward kernel with shared memory accumulation
-template <uint32_t C>
-__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDA_SharedMemory(
-    const uint2* __restrict__ ranges,
-    const uint32_t* __restrict__ point_list,
-    int W, int H,
-    const float* __restrict__ bg_color,
-    const float2* __restrict__ points_xy_image,
-    const float4* __restrict__ conic_opacity,
-    const float* __restrict__ colors,
-    const float* __restrict__ final_Ts,
-    const uint32_t* __restrict__ n_contrib,
-    const float* __restrict__ dL_dpixels,
-    float3* __restrict__ dL_dmean2D,
-    float4* __restrict__ dL_dconic2D,
-    float* __restrict__ dL_dopacity,
-    float* __restrict__ dL_dcolors) 
-{
-    // Setup cooperative groups and Compute necessary block info.
-    auto block = cg::this_thread_block();
-    const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-    const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-    const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-    const uint32_t pix_id = W * pix.y + pix.x;
-    const float2 pixf = { (float)pix.x, (float)pix.y };
+// 	const bool inside = pix.x < W&& pix.y < H;
+// 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 
-    const bool inside = pix.x < W && pix.y < H;
-    const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+// 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+// 	bool done = !inside;
+// 	int toDo = range.y - range.x;
 
-	bool done = !inside;
-	int toDo = range.y - range.x;
-
-    __shared__ int collected_id[BLOCK_SIZE];
-    __shared__ float2 collected_xy[BLOCK_SIZE];
-    __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-    __shared__ float collected_colors[C * BLOCK_SIZE];
-
-    // Shared memory for gradient accumulation
-    __shared__ int shared_global_id[BLOCK_SIZE];
-    __shared__ float shared_dmeanX[BLOCK_SIZE];
-    __shared__ float shared_dmeanY[BLOCK_SIZE];
-    __shared__ float shared_dconicX[BLOCK_SIZE];
-    __shared__ float shared_dconicY[BLOCK_SIZE];
-    __shared__ float shared_dconicW[BLOCK_SIZE];
-    __shared__ float shared_dopacity[BLOCK_SIZE];
-    __shared__ float shared_dcolors[C * BLOCK_SIZE];
-
-    // Initialize shared memory
-    if (block.thread_rank() < BLOCK_SIZE) {
-        shared_global_id[block.thread_rank()] = -1; // Initialize to an invalid ID
-        shared_dmeanX[block.thread_rank()] = 0.0f;
-        shared_dmeanY[block.thread_rank()] = 0.0f;
-        shared_dconicX[block.thread_rank()] = 0.0f;
-        shared_dconicY[block.thread_rank()] = 0.0f;
-        shared_dconicW[block.thread_rank()] = 0.0f;
-        shared_dopacity[block.thread_rank()] = 0.0f;
-        for (int ch = 0; ch < C; ++ch) {
-            shared_dcolors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
-        }
-    }
-    block.sync();
-
-	// In the forward, we stored the final value for T, the
-	// product of all (1 - alpha) factors.
-    const float T_final = final_Ts[pix_id];
-    float T = T_final;
-
-	// We start from the back. The ID of the last contributing
-	// Gaussian is known from each pixel from the forward.
-	uint32_t contributor = toDo;
-	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-
-    float accum_rec[C] = {0};
-    float dL_dpixel[C];
-
-	if (inside)
-		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-
-
-    float last_alpha = 0;
-    float last_color[C] = {0};
-
-    const float ddelx_dx = 0.5f * W;
-    const float ddely_dy = 0.5f * H;
-
-    // Traverse all Gaussians
-	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE){
-		// Load auxiliary data into shared memory, start in the BACK
-		// and load them in revers order.
-        block.sync();
-        const int progress = i * BLOCK_SIZE + block.thread_rank();
-        if (range.x + progress < range.y) {
-            const int coll_id = point_list[range.y - progress - 1];
-            collected_id[block.thread_rank()] = coll_id;
-            collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-            collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-            for (int ch = 0; ch < C; ++ch) {
-                collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + ch];
-            }
-        }
-        block.sync();
-
-        // Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
-        {
-
-			// Keep track of current Gaussian ID. Skip, if this one
-			// is behind the last contributor for this pixel.
-			contributor--;
-			if (contributor >= last_contributor)
-				continue;
-			
-			// Compute blending values, as before.
-            const float2 xy = collected_xy[j];
-            const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-            const float4 con_o = collected_conic_opacity[j];
-            const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-            if (power > 0.0f) continue;
-            const float G = exp(power);
-            const float alpha = min(0.99f, con_o.w * G);
-            if (alpha < 1.0f / 255.0f) continue;
-
-            T = T / (1.f - alpha);
-            const float dchannel_dcolor = alpha * T;
-			
-
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-            float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
-            float dcolors[C] = {0};
-            for (int ch = 0; ch < C; ++ch) {
-                const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-                accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-                last_color[ch] = c;
-                const float dL_dchannel = dL_dpixel[ch];
-				
-				// Update the gradients w.r.t. color of the Gaussian 
-				// but we store it in local variable dcolors which is stored at registers level
-                dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-                dcolors[ch] = dchannel_dcolor * dL_dchannel;
-            }
-
-            dL_dalpha *= T;
-            last_alpha = alpha;
-
-
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-            float bg_dot_dpixel = 0;
-            for (int ch = 0; ch < C; ++ch) {
-                bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
-            }
-            dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-			// Helpful reusable temporary variables
-            const float dL_dG = con_o.w * dL_dalpha;
-            const float gdx = G * d.x;
-            const float gdy = G * d.y;
-            const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-            const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-            // float dmeanX = dL_dG * dG_ddelx * ddelx_dx;
-            // float dmeanY = dL_dG * dG_ddely * ddely_dy;
-            // float dconicX = -0.5f * gdx * d.x * dL_dG;
-            // float dconicY = -0.5f * gdx * d.y * dL_dG;
-            // float dconicW = -0.5f * gdy * d.y * dL_dG;
-            // float dopacity = G * dL_dalpha;
-
-            // Search and accumulate logic in shared memory
-			// Here we search for the gaussians IDs effected the same pixel. If found
-			// we update the shared memory values. If not found, we add a new entry to shared memory 
-			// for that gaussian gradient parameters.
-            bool found = false;
-            for (int k = 0; k < BLOCK_SIZE; ++k) {
-                if (shared_global_id[k] == global_id) {
-                    shared_dmeanX[k] += dL_dG * dG_ddelx * ddelx_dx;
-                    shared_dmeanY[k] += dL_dG * dG_ddely * ddely_dy;
-                    shared_dconicX[k] += -0.5f * gdx * d.x * dL_dG;
-                    shared_dconicY[k] += -0.5f * gdx * d.y * dL_dG;
-                    shared_dconicW[k] += -0.5f * gdy * d.y * dL_dG;
-                    shared_dopacity[k] +=  G * dL_dalpha;
-                    for (int ch = 0; ch < C; ++ch) {
-                        shared_dcolors[ch * BLOCK_SIZE + k] += dcolors[ch];
-                    }
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                for (int k = 0; k < BLOCK_SIZE; ++k) {
-                    if (shared_global_id[k] == -1) {
-                        shared_global_id[k] = global_id;
-                        shared_dmeanX[k] = dL_dG * dG_ddelx * ddelx_dx;
-                        shared_dmeanY[k] = dL_dG * dG_ddely * ddely_dy;
-                        shared_dconicX[k] = -0.5f * gdx * d.x * dL_dG;
-                        shared_dconicY[k] = -0.5f * gdx * d.y * dL_dG;
-                        shared_dconicW[k] = -0.5f * gdy * d.y * dL_dG;
-                        shared_dopacity[k] = G * dL_dalpha;
-                        for (int ch = 0; ch < C; ++ch) {
-                            shared_dcolors[ch * BLOCK_SIZE + k] = dcolors[ch];
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-	}
+// 	__shared__ int collected_id[BLOCK_SIZE];
+// 	__shared__ float2 collected_xy[BLOCK_SIZE];
+// 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+// 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	
-	block.sync();
-	// Use shared memory values for final atomic updates to global memory
-	if (block.thread_rank() < BLOCK_SIZE && shared_global_id[block.thread_rank()] != -1) {
-		int global_id = shared_global_id[block.thread_rank()];
-		atomicAdd(&(dL_dmean2D[global_id].x), shared_dmeanX[block.thread_rank()]);
-		atomicAdd(&(dL_dmean2D[global_id].y), shared_dmeanY[block.thread_rank()]);
-		atomicAdd(&(dL_dconic2D[global_id].x), shared_dconicX[block.thread_rank()]);
-		atomicAdd(&(dL_dconic2D[global_id].y), shared_dconicY[block.thread_rank()]);
-		atomicAdd(&(dL_dconic2D[global_id].w), shared_dconicW[block.thread_rank()]);
-		atomicAdd(&(dL_dopacity[global_id]), shared_dopacity[block.thread_rank()]);
-		for (int ch = 0; ch < C; ++ch) {
-			atomicAdd(&(dL_dcolors[global_id * C + ch]), shared_dcolors[ch * BLOCK_SIZE + block.thread_rank()]);
-		}
-	}
+// 	// Declare shared memory for dL_dopacity (opacity)
+// 	__shared__ float shared_dL_dopacity[BLOCK_SIZE];
+// 	// Declare shared memory for dL_dmean2D (x and y components)
+// 	__shared__ float shared_dL_dmean2D_x[BLOCK_SIZE];
+// 	__shared__ float shared_dL_dmean2D_y[BLOCK_SIZE];
 
-}
+// 	// Declare shared memory for dL_dconic2D (x, y, and w components)
+// 	__shared__ float shared_dL_dconic2D_x[BLOCK_SIZE];
+// 	__shared__ float shared_dL_dconic2D_y[BLOCK_SIZE];
+// 	__shared__ float shared_dL_dconic2D_w[BLOCK_SIZE];
+// 	__shared__ float shared_dL_dcolors[C * BLOCK_SIZE];
 
+// 	// In the forward, we stored the final value for T, the
+// 	// product of all (1 - alpha) factors.
+// 	const float T_final = inside ? final_Ts[pix_id] : 0;
+// 	float T = T_final;
+
+// 	// We start from the back. The ID of the last contributing
+// 	// Gaussian is known from each pixel from the forward.
+// 	uint32_t contributor = toDo;
+// 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+
+// 	float accum_rec[C] = { 0 };
+
+
+// 	float dL_dpixel[C];
+// 	if (inside)
+// 		for (int i = 0; i < C; i++)
+// 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+
+// 	float last_alpha = 0;
+// 	float last_color[C] = { 0 };
+
+// 	// Gradient of pixel coordinate w.r.t. normalized
+// 	// screen-space viewport corrdinates (-1 to 1)
+// 	const float ddelx_dx = 0.5 * W;
+// 	const float ddely_dy = 0.5 * H;
+
+// 	// Traverse all Gaussians
+// 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+// 	{
+// 		// Load auxiliary data into shared memory, start in the BACK
+// 		// and load them in revers order.
+// 		block.sync();
+// 		const int progress = i * BLOCK_SIZE + block.thread_rank();
+// 		if (range.x + progress < range.y)
+// 		{
+// 			const int coll_id = point_list[range.y - progress - 1];
+// 			collected_id[block.thread_rank()] = coll_id;
+// 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+// 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+// 			shared_dL_dopacity[block.thread_rank()] = 0.0f;
+// 			shared_dL_dmean2D_x[block.thread_rank()] = 0.0f;
+//         	shared_dL_dmean2D_y[block.thread_rank()] = 0.0f;
+// 			shared_dL_dconic2D_x[block.thread_rank()] = 0.0f;
+// 			shared_dL_dconic2D_y[block.thread_rank()] = 0.0f;
+// 			shared_dL_dconic2D_w[block.thread_rank()] = 0.0f;
+// 			for (int i = 0; i < C; i++){
+// 				// shared_dL_dcolors[i * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+// 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+
+// 			}
+// 		}
+// 		block.sync();
+
+// 		// Iterate over Gaussians
+// 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+// 		{
+// 			// Keep track of current Gaussian ID. Skip, if this one
+// 			// is behind the last contributor for this pixel.
+// 			contributor--;
+// 			if (contributor >= last_contributor)
+// 				continue;
+
+// 			// Compute blending values, as before.
+// 			const float2 xy = collected_xy[j];
+// 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+// 			const float4 con_o = collected_conic_opacity[j];
+// 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+// 			if (power > 0.0f)
+// 				continue;
+// 			const float G = exp(power);
+// 			const float alpha = min(0.99f, con_o.w * G);
+// 			if (alpha < 1.0f / 255.0f)
+// 				continue;
+// 			T = T / (1.f - alpha);
+// 			const float dchannel_dcolor = alpha * T;
+// 			// Propagate gradients to per-Gaussian colors and keep
+// 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+// 			// pair).
+// 			float dL_dalpha = 0.0f;
+			
+// 			float local_dL_dcolors[C] = {0.0f};
+
+// 			const int global_id = collected_id[j];
+// 			for (int ch = 0; ch < C; ch++)
+// 			{
+// 				const float c = collected_colors[ch * BLOCK_SIZE + j];
+// 				// Update last color (to be used in the next iteration)
+// 				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+// 				last_color[ch] = c;
+// 				const float dL_dchannel = dL_dpixel[ch];
+// 				float local_contrib = dchannel_dcolor * dL_dchannel;
+// 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+// 				// Update the gradients w.r.t. color of the Gaussian.
+// 				// Atomic, since this pixel is just one of potentially
+// 				// many that were affected by this Gaussian.
+
+
+// 				local_dL_dcolors[ch] += dchannel_dcolor * dL_dchannel;
+
+// 				// atomicAdd(&(shared_dL_dcolors[ch * BLOCK_SIZE + j]), dchannel_dcolor * dL_dchannel);
+// 			}
+
+// 			// Accumulate contributions for overlapping Gaussians
+// 			for (int offset = block.size() / 2; offset > 0; offset /= 2) {
+// 				if (collected_id[block.thread_rank()] == collected_id[block.thread_rank() + offset]) {
+// 					for (int ch = 0; ch < C; ch++) {
+// 						local_dL_dcolors[ch] += local_dL_dcolors[ch + offset];
+// 					}
+// 				}
+// 				block.sync();
+// 			}
+
+
+// 			// Write accumulated results to global memory (one thread per Gaussian)
+// 			if (block.thread_rank() == 0) {
+// 				for (int ch = 0; ch < C; ch++) {
+// 					atomicAdd(&dL_dcolors[global_id * C + ch], local_dL_dcolors[ch]);
+// 				}
+// 			}
+
+
+
+// 			dL_dalpha *= T;
+// 			// Update last alpha (to be used in the next iteration)
+// 			last_alpha = alpha;
+
+
+
+//             // Account for fact that alpha also influences how much of
+//             // the background color is added if nothing left to blend
+//             float bg_dot_dpixel = 0;
+//             bg_dot_dpixel += bg_color[0] * dL_dpixel[0];
+//             bg_dot_dpixel += bg_color[1] * dL_dpixel[1];
+//             bg_dot_dpixel += bg_color[2] * dL_dpixel[2];
+//             dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+// 			// Helpful reusable temporary variables
+// 			const float dL_dG = con_o.w * dL_dalpha;
+// 			const float gdx = G * d.x;
+// 			const float gdy = G * d.y;
+// 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+// 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+// 			// // Update gradients w.r.t. 2D mean position of the Gaussian
+// 			atomicAdd(&shared_dL_dconic2D_x[j], -0.5f * gdx * d.x * dL_dG);
+// 			atomicAdd(&shared_dL_dconic2D_y[j], -0.5f * gdx * d.y * dL_dG);
+// 			atomicAdd(&shared_dL_dconic2D_w[j], -0.5f * gdy * d.y * dL_dG);
+// 			// Update gradients w.r.t. opacity of the Gaussian
+// 			atomicAdd(&shared_dL_dmean2D_x[j], dL_dG * dG_ddelx * ddelx_dx);
+// 			atomicAdd(&shared_dL_dmean2D_y[j], dL_dG * dG_ddely * ddely_dy);
+//             atomicAdd(&shared_dL_dopacity[j], G * dL_dalpha);
+
+// 		}
+// 		block.sync();
+// 		// Write accumulated gradients to global memory
+// 		if (range.x + progress < range.y) {
+// 			const int global_id = collected_id[block.thread_rank()];
+// 			atomicAdd(&dL_dmean2D[global_id].x, shared_dL_dmean2D_x[block.thread_rank()]);
+//         	atomicAdd(&dL_dmean2D[global_id].y, shared_dL_dmean2D_y[block.thread_rank()]);
+// 			atomicAdd(&dL_dconic2D[global_id].x, shared_dL_dconic2D_x[block.thread_rank()]);
+// 			atomicAdd(&dL_dconic2D[global_id].y, shared_dL_dconic2D_y[block.thread_rank()]);
+// 			atomicAdd(&dL_dconic2D[global_id].w, shared_dL_dconic2D_w[block.thread_rank()]);
+// 			// for (int ch = 0; ch < C; ch++)
+// 			// 	atomicAdd(&dL_dcolors[global_id * C + ch], shared_dL_dcolors[ch * BLOCK_SIZE + block.thread_rank()]);
+// 			atomicAdd(&dL_dopacity[global_id], shared_dL_dopacity[block.thread_rank()]);
+// 		}
+// 	}
+// }
 
 // DISTWAR - Original 3DGS backward kernel implementation
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDABW_original(
+renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -666,6 +682,19 @@ renderCUDABW_original(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+
+
+	// Initialization of shared memory
+	if (block.thread_rank() < BLOCK_SIZE) {
+		collected_id[block.thread_rank()] = -1;
+		collected_xy[block.thread_rank()] = make_float2(0.0f, 0.0f);
+		collected_conic_opacity[block.thread_rank()] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+		for (int ch = 0; ch < C; ch++) {
+			collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = 0.0f;
+		}
+	}
+	block.sync(); // Ensure initialization is completed before use
+
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors.
@@ -710,6 +739,7 @@ renderCUDABW_original(
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 		}
 		block.sync();
+
 
 		// Iterate over Gaussians
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
@@ -792,6 +822,7 @@ renderCUDABW_original(
 	}
 }
 
+
 void BACKWARD::preprocess(
 	int P, int D, int M,
 	const float3* means3D,
@@ -814,13 +845,14 @@ void BACKWARD::preprocess(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	cudaStream_t stream)
 {
 	// Propagate gradients for the path of 2D conic matrix computation.
 	// Somewhat long, thus it is its own kernel rather than being part of
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
 	// modified and gradient w.r.t. 3D covariance matrix has been computed.
-	computeCov2DCUDA <<<(P + 255) / 256, 256 >>> (
+	computeCov2DCUDA <<<(P + 255) / 256, 256, 0, stream>>> (
 		P,
 		means3D,
 		radii,
@@ -837,7 +869,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> <<< (P + 255) / 256, 256 >>> (
+	preprocessCUDA<NUM_CHANNELS> <<< (P + 255) / 256, 256, 0, stream>>> (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -857,8 +889,8 @@ void BACKWARD::preprocess(
 		dL_drot);
 }
 
-unsigned ct = 0;
-unsigned bw_impl = 9999999;
+// unsigned ct = 0;
+// unsigned bw_impl = 9999999;
 
 void BACKWARD::render(
 	const dim3 grid, const dim3 block,
@@ -875,78 +907,95 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	cudaStream_t stream)
 {
-    ++ct;
-    bool pt = ct >= 10000 && ct <= 10000;
 
-	if (ct == 1) {
 
-		char * bw_impl_str = std::getenv("BW_IMPLEMENTATION");
-		bw_impl = 0;
-		if (bw_impl_str != nullptr) {
-			bw_impl = std::atoi(bw_impl_str);
-			assert(bw_impl <= 4);
-		}
-	}
+	renderCUDA<NUM_CHANNELS> <<<grid, block, 0, stream>>>(
+		ranges,
+		point_list,
+		W, H,
+		bg_color,
+		means2D,
+		conic_opacity,
+		colors,
+		final_Ts,
+		n_contrib,
+		dL_dpixels,
+		dL_dmean2D,
+		dL_dconic2D,
+		dL_dopacity,
+		dL_dcolors
+	);
 
-    if (ct == 1) {
-        std::cout << "\n=======================" << std::endl;
-    }
-
-	switch(bw_impl) {
-		case 0:
-		if (ct == 1) {
-			std::cout << "BW IMPLEMENTATION: ORIGINAL (no optimization)\n";
-		}
-		renderCUDABW_original<NUM_CHANNELS> <<<grid, block >>>(
-			ranges,
-			point_list,
-			W, H,
-			bg_color,
-			means2D,
-			conic_opacity,
-			colors,
-			final_Ts,
-			n_contrib,
-			dL_dpixels,
-			dL_dmean2D,
-			dL_dconic2D,
-			dL_dopacity,
-			dL_dcolors
-		);
-		break;
-
-		case 1:
-		if (ct == 1) {
-			std::cout << "BW IMPLEMENTATION: Shared Memory Gradient Accumulation\n";
-		}
-		renderCUDA_SharedMemory<NUM_CHANNELS> <<<grid, block >>>(
-			ranges,
-			point_list,
-			W, H,
-			bg_color,
-			means2D,
-			conic_opacity,
-			colors,
-			final_Ts,
-			n_contrib,
-			dL_dpixels,
-			dL_dmean2D,
-			dL_dconic2D,
-			dL_dopacity,
-			dL_dcolors);
-		break;
-		default:
-		std::cout << "ERROR: Undefined backward kernel implementation " << bw_impl << ". Please fix environment variable BW_IMPLEMENTATION to valid value.\n";
-		std::cout << "BW_IMPLEMENTATION modes:\n" <<
-		"0: original 3DGS implementation\n" <<
-		"1: Shared Memory Gradient Accumulation\n" << std::endl;
-		assert(0);
-		break;
-	}
+    // ++ct;
+    // bool pt = ct >= 10000 && ct <= 10000;
 	// if (ct == 1) {
-	// 	std::cout << "BALANCE_THRESHOLD: " << balance_threshold << std::endl;
-	// 	std::cout << "=======================\n" << std::endl;
+	// 	char * bw_impl_str = std::getenv("BW_IMPLEMENTATION");
+	// 	bw_impl = 0;
+	// 	if (bw_impl_str != nullptr) {
+	// 		bw_impl = std::atoi(bw_impl_str);
+	// 		assert(bw_impl <= 4);
+	// 	}
 	// }
+    // if (ct == 1) {
+    //     std::cout << "\n=======================" << std::endl;
+    // }
+
+	// switch(bw_impl) {
+	// 	case 0:
+	// 	if (ct == 1) {
+	// 		std::cout << "BW IMPLEMENTATION: ORIGINAL (no optimization)\n";
+	// 	}
+	// 	renderCUDABW_original<NUM_CHANNELS> <<<grid, block >>>(
+	// 		ranges,
+	// 		point_list,
+	// 		W, H,
+	// 		bg_color,
+	// 		means2D,
+	// 		conic_opacity,
+	// 		colors,
+	// 		final_Ts,
+	// 		n_contrib,
+	// 		dL_dpixels,
+	// 		dL_dmean2D,
+	// 		dL_dconic2D,
+	// 		dL_dopacity,
+	// 		dL_dcolors
+	// 	);
+	// 	break;
+
+	// 	case 1:
+	// 	if (ct == 1) {
+	// 		std::cout << "BW IMPLEMENTATION: Shared Memory Gradient Accumulation\n";
+	// 	}
+	// 	renderCUDA_SharedMemory<NUM_CHANNELS> <<<grid, block >>>(
+	// 		ranges,
+	// 		point_list,
+	// 		W, H,
+	// 		bg_color,
+	// 		means2D,
+	// 		conic_opacity,
+	// 		colors,
+	// 		final_Ts,
+	// 		n_contrib,
+	// 		dL_dpixels,
+	// 		dL_dmean2D,
+	// 		dL_dconic2D,
+	// 		dL_dopacity,
+	// 		dL_dcolors);
+	// 	break;
+	// 	default:
+	// 	std::cout << "ERROR: Undefined backward kernel implementation " << bw_impl << ". Please fix environment variable BW_IMPLEMENTATION to valid value.\n";
+	// 	std::cout << "BW_IMPLEMENTATION modes:\n" <<
+	// 	"0: original 3DGS implementation\n" <<
+	// 	"1: Shared Memory Gradient Accumulation\n" << std::endl;
+	// 	assert(0);
+	// 	break;
+	// }
+	// // if (ct == 1) {
+	// // 	std::cout << "BALANCE_THRESHOLD: " << balance_threshold << std::endl;
+	// // 	std::cout << "=======================\n" << std::endl;
+	// // }
 }

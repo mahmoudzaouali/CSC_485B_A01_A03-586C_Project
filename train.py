@@ -28,6 +28,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset) # Tensorboard Writer initialization  
@@ -47,8 +48,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_stack = None
     ema_loss_for_log = 0.0
 
-    # Code added for profiling
-    # warmup_iters = 15000  # Define your number of warmup iterations
     
     # Define iterations to profile
     profile_iterations = {1000, 3000, 7000}
@@ -56,10 +55,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):   
-
-        # if iteration == warmup_iters:
-        #     # Start CUDA profiler after warmup
-        #     torch.cuda.cudart().cudaProfilerStart()
 
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -75,8 +70,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     break
             except Exception as e:
                 network_gui.conn = None
-        # Annotate the iteration with NVTX
-        # torch.cuda.nvtx.range_push("Iteration {}".format(iteration))
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -84,12 +77,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
-
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
+        
+        batch_size = 2
+        viewpoint_cam = []
+        
+        for _ in range(batch_size):
+            # Pick a random Camera
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy() 
+            # We stack the camera view corresponding to the batch size
+            viewpoint_cam.append(viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1)))
+        
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -97,38 +95,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Annotate forward pass
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-
-        # torch.cuda.nvtx.range_push("render")
+        torch.cuda.nvtx.range_push("render")
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        # torch.cuda.nvtx.range_pop() # End forward pass
-        # if iteration in profile_iterations:
-        #     torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.nvtx.range_pop() # End forward pass
 
+
+        # Batched Results coming from the forward pass
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-        #Annotate loss computation
-
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # Annotate backward pass
-
+        gt_images = torch.stack([cam.original_image.cuda() for cam in viewpoint_cam])  # Shape: (B, C, H, W)
+        # Loss computation
+        Ll1 = l1_loss(image, gt_images)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_images))
+        
         # Start and stop profiler only at specified iterations for backward pass
         if iteration in profile_iterations:
             torch.cuda.cudart().cudaProfilerStart()
 
-
         torch.cuda.nvtx.range_push("backward")
         loss.backward()
-        torch.cuda.nvtx.range_pop() # End backward pass
 
+        torch.cuda.nvtx.range_pop() # End backward pass
 
         if iteration in profile_iterations:
             torch.cuda.cudart().cudaProfilerStop()
-
-
         iter_end.record()
 
         with torch.no_grad():
@@ -148,9 +138,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                for v in range(radii.shape[0]):
+                    # Extract per-view radii and visibility filter
+                    radii_view = radii[v]
+                    visibility_filter_view = visibility_filter[v]
+                    
+                    # Update max_radii2D for this view
+                    gaussians.max_radii2D[visibility_filter_view] = torch.max(
+                        gaussians.max_radii2D[visibility_filter_view],
+                        radii_view[visibility_filter_view]
+                    )
+                    # gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter_view)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
